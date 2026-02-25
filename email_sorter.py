@@ -15,7 +15,7 @@ from google import genai
 
 load_dotenv()
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+SCOPES = ["https://mail.google.com/"]
 
 SYSTEM_LABELS_TO_EXCLUDE = {
     "INBOX", "SENT", "DRAFT", "SPAM", "TRASH",
