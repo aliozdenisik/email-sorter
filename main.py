@@ -25,7 +25,8 @@ SYSTEM_LABELS_TO_EXCLUDE = {
     "CHAT",
 }
 
-AUTO_SORTED_LABEL_NAME = "AutoSorted"
+PROCESSED_IDS_FILE = "processed_ids.json"
+MAX_PROCESSED_IDS = 5000
 MAX_MESSAGES_PER_CYCLE = 10
 GEMINI_DELAY_SECONDS = 7
 DAILY_CALL_LIMIT = 240
@@ -46,8 +47,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def load_processed_ids() -> set[str]:
+    """Load processed message IDs from local file."""
+    path = Path(PROCESSED_IDS_FILE)
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text())
+        return set(data)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+
+
+def save_processed_ids(processedIds: set[str]) -> None:
+    """Save processed message IDs to local file, trimming to MAX_PROCESSED_IDS."""
+    idList = list(processedIds)
+    if len(idList) > MAX_PROCESSED_IDS:
+        idList = idList[-MAX_PROCESSED_IDS:]
+    Path(PROCESSED_IDS_FILE).write_text(json.dumps(idList))
+
+
 def authenticate_gmail() -> Credentials:
-    """Load or create OAuth2 credentials, converting web type to installed."""
+    """Load or create OAuth2 credentials."""
     token_path = Path(TOKEN_FILE)
     credentials = None
 
@@ -92,28 +113,8 @@ def build_gemini_client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def ensure_auto_sorted_label(service) -> str:
-    """Find or create the AutoSorted label, return its ID."""
-    results = service.users().labels().list(userId="me").execute()
-    allLabels = results.get("labels", [])
-
-    for label in allLabels:
-        if label["name"] == AUTO_SORTED_LABEL_NAME:
-            logger.info("Found existing AutoSorted label: %s", label["id"])
-            return label["id"]
-
-    labelBody = {
-        "name": AUTO_SORTED_LABEL_NAME,
-        "labelListVisibility": "labelShow",
-        "messageListVisibility": "show",
-    }
-    created = service.users().labels().create(userId="me", body=labelBody).execute()
-    logger.info("Created AutoSorted label: %s", created["id"])
-    return created["id"]
-
-
 def fetch_user_labels(service) -> dict[str, str]:
-    """Fetch user labels, excluding system labels and AutoSorted. Returns {name: id}."""
+    """Fetch user labels, excluding system labels. Returns {name: id}."""
     results = service.users().labels().list(userId="me").execute()
     allLabels = results.get("labels", [])
 
@@ -123,8 +124,6 @@ def fetch_user_labels(service) -> dict[str, str]:
         labelType = label.get("type", "")
         if labelType != "user":
             continue
-        if labelName == AUTO_SORTED_LABEL_NAME:
-            continue
         if labelName.upper() in SYSTEM_LABELS_TO_EXCLUDE:
             continue
         userLabels[labelName] = label["id"]
@@ -133,23 +132,24 @@ def fetch_user_labels(service) -> dict[str, str]:
     return userLabels
 
 
-def fetch_unprocessed_messages(service) -> list[dict]:
-    """Fetch unprocessed inbox messages (max MAX_MESSAGES_PER_CYCLE)."""
-    query = "in:inbox -label:AutoSorted"
+def fetch_inbox_messages(service, processedIds: set[str]) -> list[dict]:
+    """Fetch inbox messages, filtering out already processed ones."""
     try:
         results = (
             service.users()
             .messages()
-            .list(userId="me", q=query, maxResults=MAX_MESSAGES_PER_CYCLE)
+            .list(userId="me", q="in:inbox", maxResults=50)
             .execute()
         )
     except Exception as fetchError:
         logger.error("Failed to fetch messages: %s", fetchError)
         return []
 
-    messages = results.get("messages", [])
-    logger.info("Found %d unprocessed messages", len(messages))
-    return messages
+    allMessages = results.get("messages", [])
+    unprocessed = [m for m in allMessages if m["id"] not in processedIds]
+    unprocessed = unprocessed[:MAX_MESSAGES_PER_CYCLE]
+    logger.info("Found %d unprocessed messages (of %d in inbox)", len(unprocessed), len(allMessages))
+    return unprocessed
 
 
 def extract_email_content(service, messageId: str) -> tuple[str, str]:
@@ -264,31 +264,26 @@ def process_single_message(
     geminiClient: genai.Client,
     messageId: str,
     userLabels: dict[str, str],
-    autoSortedLabelId: str,
 ) -> bool:
-    """Process a single email: extract, classify, apply labels. Returns True if a Gemini call was made."""
+    """Process a single email: extract, classify, apply label. Returns True if a Gemini call was made."""
     subject, body = extract_email_content(service, messageId)
     if not subject and not body:
-        logger.warning("Empty email content for %s, marking as processed", messageId)
-        apply_labels(service, messageId, [autoSortedLabelId])
+        logger.warning("Empty email content for %s, skipping", messageId)
         return False
 
     labelNames = list(userLabels.keys())
     if not labelNames:
         logger.warning("No user labels available for classification")
-        apply_labels(service, messageId, [autoSortedLabelId])
         return False
 
     chosenLabel = classify_email(geminiClient, subject, body, labelNames)
 
-    labelsToApply = [autoSortedLabelId]
     if chosenLabel:
-        labelsToApply.append(userLabels[chosenLabel])
-        logger.info("Email '%s' → label '%s'", subject[:50], chosenLabel)
+        apply_labels(service, messageId, [userLabels[chosenLabel]])
+        logger.info("Email '%s' -> label '%s'", subject[:50], chosenLabel)
     else:
-        logger.info("Email '%s' → no matching label", subject[:50])
+        logger.info("Email '%s' -> no matching label", subject[:50])
 
-    apply_labels(service, messageId, labelsToApply)
     return True
 
 
@@ -296,11 +291,11 @@ def run_poll_cycle(
     service,
     geminiClient: genai.Client,
     userLabels: dict[str, str],
-    autoSortedLabelId: str,
+    processedIds: set[str],
     dailyCallCount: int,
 ) -> int:
     """Process all unprocessed messages in one cycle. Returns updated daily call count."""
-    messages = fetch_unprocessed_messages(service)
+    messages = fetch_inbox_messages(service, processedIds)
     if not messages:
         return dailyCallCount
 
@@ -309,15 +304,17 @@ def run_poll_cycle(
             logger.warning("Daily Gemini call limit reached (%d), skipping remaining", DAILY_CALL_LIMIT)
             break
 
-        madeCall = process_single_message(
-            service, geminiClient, message["id"], userLabels, autoSortedLabelId,
-        )
+        messageId = message["id"]
+        madeCall = process_single_message(service, geminiClient, messageId, userLabels)
+        processedIds.add(messageId)
+
         if madeCall:
             dailyCallCount += 1
 
         if index < len(messages) - 1:
             time.sleep(GEMINI_DELAY_SECONDS)
 
+    save_processed_ids(processedIds)
     return dailyCallCount
 
 
@@ -328,9 +325,10 @@ def main():
     service = build_gmail_service(credentials)
     geminiClient = build_gemini_client()
 
-    autoSortedLabelId = ensure_auto_sorted_label(service)
     userLabels = fetch_user_labels(service)
+    processedIds = load_processed_ids()
     logger.info("Available labels: %s", list(userLabels.keys()))
+    logger.info("Loaded %d previously processed IDs", len(processedIds))
 
     dailyCallCount = 0
     cycleCount = 0
@@ -349,7 +347,7 @@ def main():
                 logger.info("Labels refreshed: %s", list(userLabels.keys()))
 
             dailyCallCount = run_poll_cycle(
-                service, geminiClient, userLabels, autoSortedLabelId, dailyCallCount,
+                service, geminiClient, userLabels, processedIds, dailyCallCount,
             )
             cycleCount += 1
 
