@@ -72,24 +72,7 @@ def authenticate_gmail() -> Credentials:
         logger.error("Client secret file not found: %s", CLIENT_SECRET_FILE)
         sys.exit(1)
 
-    with open(secret_path) as secretFile:
-        clientConfig = json.load(secretFile)
-
-    if "web" in clientConfig:
-        webData = clientConfig["web"]
-        clientConfig = {
-            "installed": {
-                "client_id": webData["client_id"],
-                "project_id": webData.get("project_id", ""),
-                "auth_uri": webData["auth_uri"],
-                "token_uri": webData["token_uri"],
-                "auth_provider_x509_cert_url": webData.get("auth_provider_x509_cert_url", ""),
-                "client_secret": webData["client_secret"],
-                "redirect_uris": ["http://localhost"],
-            }
-        }
-
-    flow = InstalledAppFlow.from_client_config(clientConfig, SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(str(secret_path), SCOPES)
     credentials = flow.run_local_server(port=0)
     token_path.write_text(credentials.to_json())
     logger.info("Authentication successful, token saved")
